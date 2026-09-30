@@ -150,6 +150,16 @@ def property_string(text: str, key: str) -> str | None:
     return match.group(1) if match else None
 
 
+def property_string_value(text: str, key: str) -> str | None:
+    pattern = re.compile(
+        rf'"{re.escape(key)}"\s*=\s*(?:<"([^"]*)">|"([^"]*)")', re.I
+    )
+    match = pattern.search(text)
+    if match is None:
+        return None
+    return match.group(1) if match.group(1) is not None else match.group(2)
+
+
 def property_hex(text: str, key: str) -> bytes | None:
     pattern = re.compile(rf'"{re.escape(key)}"\s*=\s*<([0-9a-fA-F]+)>')
     match = pattern.search(text)
@@ -167,6 +177,42 @@ def decode_ascii_property(text: str, key: str) -> str | None:
         return None
     decoded = value.split(b"\0", 1)[0].decode("ascii", errors="replace").strip()
     return decoded or None
+
+
+def read_ioreg_sources(root: Path) -> list[tuple[str, str]]:
+    sources = []
+    for relative_path in (
+        "ioreg/IODeviceTree.txt",
+        "ioreg/IOService.txt",
+        "ioreg/IOPower.txt",
+    ):
+        try:
+            sources.append(
+                (relative_path, (root / relative_path).read_text(encoding="utf-8", errors="replace"))
+            )
+        except OSError:
+            continue
+    return sources
+
+
+def registry_node_text(text: str, node_fragment: str) -> str | None:
+    node_pattern = re.compile(r"^\s*(?P<prefix>(?:\|\s*)*)\+-o\s+(?P<name>\S+)")
+    lines = text.splitlines()
+    matching_nodes = []
+    for index, line in enumerate(lines):
+        match = node_pattern.match(line)
+        if match is None or node_fragment.casefold() not in match.group("name").casefold():
+            continue
+
+        node_depth = match.group("prefix").count("|")
+        end = len(lines)
+        for next_index in range(index + 1, len(lines)):
+            next_match = node_pattern.match(lines[next_index])
+            if next_match and next_match.group("prefix").count("|") <= node_depth:
+                end = next_index
+                break
+        matching_nodes.append("\n".join(lines[index:end]))
+    return max(matching_nodes, key=len) if matching_nodes else None
 
 
 def extract_display(root: Path) -> dict[str, Any]:
@@ -293,8 +339,71 @@ def extract_storage(root: Path) -> dict[str, Any]:
         "nand_vendor": field_string("vendor-name"),
         "nand_type": nand_type,
         "bits_per_cell": bits_per_cell,
+        "cell_type": field_int("cell-type"),
+        "chip_id": field_string("chip-id"),
         "nand_marketing_name": marketing_name,
+        "nand_status": property_string_value(text, "AppleNANDStatus"),
         "source": relative_path,
+    }
+
+
+def extract_wifi(root: Path) -> dict[str, Any]:
+    sources = read_ioreg_sources(root)
+    if not sources:
+        return {"available": False, "reason": "No readable IORegistry dump found."}
+
+    for key in ("witi_module_vendor", "ModuleVendor"):
+        for relative_path, text in sources:
+            module_vendor = property_string_value(text, key)
+            if module_vendor:
+                return {
+                    "available": True,
+                    "module_vendor": module_vendor,
+                    "matched_property": key,
+                    "source": relative_path,
+                }
+
+    return {
+        "available": False,
+        "reason": "No Wi-Fi module vendor property found.",
+        "source": [relative_path for relative_path, _ in sources],
+    }
+
+
+def extract_modem(root: Path) -> dict[str, Any]:
+    sources = read_ioreg_sources(root)
+    if not sources:
+        return {"available": False, "reason": "No readable IORegistry dump found."}
+
+    chipset = None
+    version = None
+    pci_node = None
+    pci_source = None
+    for relative_path, text in sources:
+        chipset = chipset or property_string(text, "baseband-chipset")
+        version = version or property_string_value(text, "baseband Version")
+        version = version or property_string_value(text, "baseband-version")
+        if pci_node is None:
+            pci_node = registry_node_text(text, "baseband-pcie")
+            if pci_node is not None:
+                pci_source = relative_path
+
+    vendor_bytes = property_hex(pci_node or "", "vendor-id")
+    vendor_value = property_string_value(pci_node or "", "vendor-id")
+    if vendor_bytes:
+        vendor_value = f"0x{int.from_bytes(vendor_bytes, byteorder='little'):04x}"
+    io_name = property_string_value(pci_node or "", "IOName")
+
+    if not any((chipset, version, vendor_value, io_name)):
+        return {"available": False, "reason": "No modem properties found in IORegistry."}
+
+    return {
+        "available": True,
+        "chipset": chipset,
+        "version": version,
+        "vendor_id": vendor_value,
+        "io_name": io_name,
+        "source": pci_source or sources[0][0],
     }
 
 
@@ -375,6 +484,8 @@ PARSERS: dict[str, Callable[[Path], dict[str, Any]]] = {
     "ram": extract_ram,
     "sales_region": extract_sales_region,
     "storage": extract_storage,
+    "wifi": extract_wifi,
+    "modem": extract_modem,
     "sourcing": extract_model_sourcing,
     # "dates": extract_dates,
 }

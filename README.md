@@ -9,7 +9,9 @@ This project is designed to read common files from an extracted iPhone sysdiagno
 - Battery information
 - Display supplier and panel metadata
 - RAM size and vendor details
-- Storage controller and NAND information
+- Storage controller, NAND type, cell count, chip ID, and status
+- Wi-Fi module vendor when reported by IORegistry
+- Modem chipset, version, and PCI identifiers when reported by IORegistry
 - Sales region / market group hints
 - Model-specific sourcing notes for supported devices
 
